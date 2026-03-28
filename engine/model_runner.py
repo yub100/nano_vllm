@@ -22,8 +22,17 @@ class ModelRunner:
         self.world_size = config.tensor_parallel_size
         self.rank = rank
         self.event = event
+        self.dist_initialized = False
 
-        dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+        if not torch.cuda.is_available():
+            raise RuntimeError(
+                "CUDA is not available. This project currently requires at least one NVIDIA GPU. "
+                "If this machine should have a GPU, please check nvidia-container-runtime / CUDA visibility."
+            )
+
+        if self.world_size > 1:
+            dist.init_process_group("nccl", "tcp://localhost:2333", world_size=self.world_size, rank=rank)
+            self.dist_initialized = True
         torch.cuda.set_device(rank)
         default_dtype = torch.get_default_dtype()
         torch.set_default_dtype(hf_config.torch_dtype)
@@ -105,13 +114,15 @@ class ModelRunner:
     def exit(self):
         if self.world_size > 1:
             self.shm.close()
-            dist.barrier()
+            if self.dist_initialized:
+                dist.barrier()
             if self.rank == 0:
                 self.shm.unlink()
         if not self.enforce_eager:
             del self.graphs, self.graph_pool
         torch.cuda.synchronize()
-        dist.destroy_process_group()
+        if self.dist_initialized:
+            dist.destroy_process_group()
 
 
     def loop(self):
@@ -286,4 +297,3 @@ class ModelRunner:
             context_lens = context_lens,
             outputs = outputs
         )
-

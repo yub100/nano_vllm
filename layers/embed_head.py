@@ -4,13 +4,14 @@ import torch.nn.functional as F
 import torch.distributed as dist
 
 from utils.context import get_context
+from utils.distributed import get_tp_rank, get_tp_world_size
 
 class VocabParallelEmbedding(nn.Module):
     # num_embeddings is umber of words in the vocabulary
     def __init__(self, num_embeddings: int, embedding_dim: int):
         super().__init__()
-        self.tp_rank = dist.get_rank()
-        self.tp_size = dist.get_world_size()
+        self.tp_rank = get_tp_rank()
+        self.tp_size = get_tp_world_size()
         self.num_embeddings = num_embeddings
         self.num_embeddings_per_partition = self.num_embeddings // self.tp_size
         self.vocab_start_idx = self.num_embeddings_per_partition * self.tp_rank
@@ -59,6 +60,5 @@ class ParallelLMHead(VocabParallelEmbedding):
         
 
         
-
 
 

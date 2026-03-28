@@ -1,7 +1,6 @@
 import torch
 from torch import nn
 from transformers import Qwen3Config
-import torch.distributed as dist
 
 
 from layers.embed_head import VocabParallelEmbedding, ParallelLMHead
@@ -10,6 +9,7 @@ from layers.linear import QKVParallelLinear, RowParallelLinear, MergedColumnPara
 from layers.rotary_embedding import get_rope
 from layers.attention import Attention
 from layers.activation import SiluAndMul
+from utils.distributed import get_tp_world_size
 
 class Qwen3Attention(nn.Module):
     def __init__(
@@ -25,7 +25,7 @@ class Qwen3Attention(nn.Module):
         rope_scaling: tuple | None = None
     ):
         super().__init__()
-        tp_size = dist.get_world_size()
+        tp_size = get_tp_world_size()
         self.total_num_heads = num_heads
         self.total_num_kv_heads = num_kv_heads
         
