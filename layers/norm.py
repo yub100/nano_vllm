@@ -26,11 +26,11 @@ class RMSNorm(nn.Module):
         x = x.to(orig_dtype).mul_(self.weight)
         return x, residual
     
-    def forward(self, x: torch.Tensor, residual: torch.Tensor | None):
+    def forward(self, x: torch.Tensor, residual: torch.Tensor | None = None):
         if residual is None:
-            return self.add_rms_forward(x, residual)
+            return self.rms_forward(x, residual)
         else:
-            return self.rms_forward(x)
+            return self.add_rms_forward(x)
 
 
         

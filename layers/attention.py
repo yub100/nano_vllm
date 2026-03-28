@@ -1,90 +1,6 @@
 import torch
 from torch import nn
-import triton
-import triton.language as tl
-
-import torch.nn.functional as F
-
-USE_FLASH_ATTN = False
-try:
-    from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
-    USE_FLASH_ATTN = True
-except ImportError:
-    pass
 from utils.context import get_context
-
-
-def torch_varlen_attn(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, scale):
-    # 简化版：逐 batch 处理（够用）
-    outputs = []
-    B = cu_seqlens_q.numel() - 1
-
-    for i in range(B):
-        q_start, q_end = cu_seqlens_q[i], cu_seqlens_q[i+1]
-        k_start, k_end = cu_seqlens_k[i], cu_seqlens_k[i+1]
-
-        qi = q[q_start:q_end]
-        ki = k[k_start:k_end]
-        vi = v[k_start:k_end]
-
-        out = F.scaled_dot_product_attention(
-            qi.unsqueeze(0),  # [1, seq, H, D]
-            ki.unsqueeze(0),
-            vi.unsqueeze(0),
-            is_causal=True
-        )
-        outputs.append(out.squeeze(0))
-
-    return torch.cat(outputs, dim=0)
-
-
-def torch_kvcache_attn(q, k_cache, v_cache, context_lens, scale):
-    # q: [N, H, D]
-    outputs = []
-
-    for i in range(q.shape[0]):
-        qi = q[i:i+1]  # [1, H, D]
-        seq_len = context_lens[i]
-
-        ki = k_cache[i, :seq_len]
-        vi = v_cache[i, :seq_len]
-
-        out = F.scaled_dot_product_attention(
-            qi.unsqueeze(0),
-            ki.unsqueeze(0),
-            vi.unsqueeze(0),
-            is_causal=True
-        )
-        outputs.append(out.squeeze(0))
-
-    return torch.cat(outputs, dim=0)
-
-@triton.jit
-def store_kvcache_kernel(
-    key_ptr,
-    key_stride,
-    value_ptr,
-    value_stride,
-    k_cache_ptr,
-    v_cache_ptr,
-    slot_mapping_ptr,
-    D: tl.constexpr
-):
-    # get idx=n
-    idx = tl.program_id(0)
-    slot = tl.load(slot_mapping_ptr + idx)
-    if slot == -1: return
-    # the relative address of key[n, 1...i]
-    key_offsets = idx * key_stride + tl.arange(0, D)
-    value_offsets = idx * value_stride + tl.arange(0, D)
-    key = tl.load(key_ptr + key_offsets)
-    value = tl.load(value_ptr + value_offsets)
-
-    # self.kv_cache = torch.empty(2, num_hidden_layers, num_kvcache_blocks, block_size, num_kv_heads, head_dim)
-    # D = num_kv_heads * head_dim = key_stride
-    cache_offsets = slot * D + tl.arange(0, D)
-    tl.store(k_cache_ptr + cache_offsets, key)
-    tl.store(v_cache_ptr + cache_offsets, value)
 
 def store_kvcache(
     key: torch.Tensor,
@@ -95,13 +11,20 @@ def store_kvcache(
 ):
     N, num_heads, head_dim = key.shape
     D = num_heads * head_dim
-    assert key.stride(-1) == 1 and value.stride(-1) == 1
-    assert key.stride(1) == head_dim and value.stride(1) == head_dim
-    # kvcache: [max_num_slots, D]
-    assert k_cache.stride(1) == D and v_cache.stride(1) == D
+    assert key.is_contiguous() and value.is_contiguous()
     assert slot_mapping.numel() == N
-    # store one k and one v per block
-    store_kvcache_kernel[(N,)](key, key.stride(0), value, value.stride(0), k_cache, v_cache, slot_mapping, D)
+
+    slot_mapping = slot_mapping.to(torch.long)
+    valid = slot_mapping != -1
+    if not torch.any(valid):
+        return
+
+    flat_key = key.view(N, D)
+    flat_value = value.view(N, D)
+    flat_k_cache = k_cache.view(-1, D)
+    flat_v_cache = v_cache.view(-1, D)
+    flat_k_cache[slot_mapping[valid]] = flat_key[valid]
+    flat_v_cache[slot_mapping[valid]] = flat_value[valid]
 
 class Attention(nn.Module):
     def __init__(
@@ -116,57 +39,86 @@ class Attention(nn.Module):
         self.head_dim = head_dim
         self.scale = scale
         self.num_kv_heads = num_kv_heads
-        # if there not warm_up, it can be None and bind into physical address after ModelRunner.allocate_kv_cache()
-        self.k_cache = self.v_cache = torch.tensor([])
+        self.k_cache = torch.tensor([])
+        self.v_cache = torch.tensor([])
+
+    def _expand_kv_heads(self, x: torch.Tensor) -> torch.Tensor:
+        if self.num_heads == self.num_kv_heads:
+            return x
+        assert self.num_heads % self.num_kv_heads == 0
+        repeat = self.num_heads // self.num_kv_heads
+        return x.repeat_interleave(repeat, dim=1)
+
+    def _attention(
+        self,
+        q: torch.Tensor,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        prefix_len: int = 0,
+        causal: bool = True,
+    ) -> torch.Tensor:
+        out_dtype = q.dtype
+        q = q.float()
+        k = self._expand_kv_heads(k.float())
+        v = self._expand_kv_heads(v.float())
+
+        # scores: [num_heads, q_len, k_len]
+        scores = torch.einsum("qhd,khd->hqk", q, k) * self.scale
+        if causal:
+            q_len = q.size(0)
+            k_len = k.size(0)
+            q_pos = prefix_len + torch.arange(q_len, device=q.device)
+            k_pos = torch.arange(k_len, device=q.device)
+            mask = k_pos.unsqueeze(0) <= q_pos.unsqueeze(1)
+            scores = scores.masked_fill(~mask.unsqueeze(0), float("-inf"))
+
+        probs = torch.softmax(scores, dim=-1)
+        out = torch.einsum("hqk,khd->qhd", probs, v)
+        return out.to(out_dtype)
+
+    def _gather_from_cache(self, block_table: torch.Tensor, seqlen: int) -> tuple[torch.Tensor, torch.Tensor]:
+        # cache shape: [num_kvcache_blocks, block_size, num_kv_heads, head_dim]
+        block_size = self.k_cache.size(1)
+        full_blocks, tail = divmod(seqlen, block_size)
+        num_blocks = full_blocks + (1 if tail > 0 else 0)
+        block_ids = block_table[:num_blocks].to(torch.long)
+
+        k = self.k_cache[block_ids].reshape(-1, self.num_kv_heads, self.head_dim)[:seqlen]
+        v = self.v_cache[block_ids].reshape(-1, self.num_kv_heads, self.head_dim)[:seqlen]
+        return k, v
     
     def forward(self, q: torch.Tensor, k: torch.Tensor, v: torch.Tensor):
         context = get_context()
         k_cache, v_cache = self.k_cache, self.v_cache
-        # unsure warmup operate rightly
+
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
+
         if context.is_prefill:
-            if context.block_tables is not None:
-                k, v = k_cache, v_cache
+            outputs = []
+            batch = context.cu_seqlens_q.numel() - 1
+            for i in range(batch):
+                q_start = int(context.cu_seqlens_q[i].item())
+                q_end = int(context.cu_seqlens_q[i + 1].item())
+                k_start = int(context.cu_seqlens_k[i].item())
+                k_end = int(context.cu_seqlens_k[i + 1].item())
 
-            if USE_FLASH_ATTN:
-                o = flash_attn_varlen_func(
-                    q, k, v,
-                    max_seqlen_q=context.max_seqlen_q,
-                    cu_seqlens_q=context.cu_seqlens_q,
-                    max_seqlen_v=context.max_seqlen_k,
-                    cu_seqlens_k=context.cu_seqlens_k,
-                    softmax_scale=self.scale,
-                    causal=True,
-                    block_table=context.block_tables
-                )
-            else:
-                o = torch_varlen_attn(
-                    q, k, v,
-                    context.cu_seqlens_q,
-                    context.cu_seqlens_k,
-                    context.max_seqlen_q,
-                    context.max_seqlen_k,
-                    self.scale
-                )
+                q_i = q[q_start:q_end]
+                k_len = k_end - k_start
+                if context.block_tables is None:
+                    k_i = k[k_start:k_end]
+                    v_i = v[k_start:k_end]
+                else:
+                    k_i, v_i = self._gather_from_cache(context.block_tables[i], k_len)
 
-        else:
-            if USE_FLASH_ATTN:
-                o = flash_attn_with_kvcache(
-                    q.unsqueeze(1),
-                    k_cache,
-                    v_cache,
-                    cache_seqlens=context.context_lens,
-                    block_table=context.block_tables,
-                    softmax_scale=self.scale,
-                    causal=True
-                )
-            else:
-                o = torch_kvcache_attn(
-                    q,
-                    k_cache,
-                    v_cache,
-                    context.context_lens,
-                    self.scale
-                )
-        return o            
+                prefix_len = k_len - q_i.size(0)
+                outputs.append(self._attention(q_i, k_i, v_i, prefix_len=prefix_len, causal=True))
+            return torch.cat(outputs, dim=0)
+
+        outputs = []
+        for i in range(q.size(0)):
+            q_i = q[i:i + 1]
+            k_len = int(context.context_lens[i].item())
+            k_i, v_i = self._gather_from_cache(context.block_tables[i], k_len)
+            outputs.append(self._attention(q_i, k_i, v_i, causal=False))
+        return torch.cat(outputs, dim=0)
