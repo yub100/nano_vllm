@@ -31,7 +31,7 @@ def store_kvcache_kernel(
     # D = num_kv_heads * head_dim = key_stride
     cache_offsets = slot * D + tl.arange(0, D)
     tl.store(k_cache_ptr + cache_offsets, key)
-    tl.store(v_cache_ptr + cache_offsets, key)
+    tl.store(v_cache_ptr + cache_offsets, value)
 
 def store_kvcache(
     key: torch.Tensor,

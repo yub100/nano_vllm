@@ -14,7 +14,7 @@ from safetensors import safe_open
 # }
 
 def default_weight_loader(param: nn.Parameter, loaded_weight: torch.Tensor):
-    param.data.cpoy_(loaded_weight)
+    param.data.copy_(loaded_weight)
 
 def load_model(model: nn.Module, path: str):
     packed_modules_mapping = getattr(model, "packed_modules_mapping", {})
@@ -39,7 +39,7 @@ def load_model(model: nn.Module, path: str):
                 # If param carries user-defined weight_loader, use it;
                 # otherwise, use default_weight_loader.
                 else:
-                    param = model.get_parameter(param_name)
+                    param = model.get_parameter(weight_name)
                     weight_loader = getattr(param, "weight_loader", default_weight_loader)
                     weight_loader(param, f.get_tensor(weight_name))
 

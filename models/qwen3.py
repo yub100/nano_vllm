@@ -24,7 +24,7 @@ class Qwen3Attention(nn.Module):
         rope_theta: float = 10000,
         rope_scaling: tuple | None = None
     ):
-        super.__init__()
+        super().__init__()
         tp_size = dist.get_world_size()
         self.total_num_heads = num_heads
         self.total_num_kv_heads = num_kv_heads
@@ -116,7 +116,7 @@ class Qwen3MLP(nn.Module):
 class Qwen3DecoderLayer(nn.Module):
     def __init__(self, config: Qwen3Config):
         super().__init__()
-        self.self_atten = Qwen3Attention(
+        self.self_attn = Qwen3Attention(
             hidden_size=config.hidden_size,
             num_heads=config.num_attention_heads,
             num_kv_heads=config.num_key_value_heads,
@@ -142,7 +142,7 @@ class Qwen3DecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
 
-        hidden_states = self.self_atten(hidden_states, positions)
+        hidden_states = self.self_attn(hidden_states, positions)
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
         return hidden_states, residual
@@ -160,15 +160,15 @@ class Qwen3Model(nn.Module):
         for layer in self.layers:
             hidden_states, residual = layer(hidden_states, positions, residual)
         hidden_states, _ = self.norm(hidden_states, residual)
-        return residual
+        return hidden_states
 
 class Qwen3ForCausalLM(nn.Module):
     packed_modules_mapping = {
-        "q_proj": {"qkv_proj", "q"},
-        "k_proj": {"qkv_proj", "k"},
-        "v_proj": {"qkv_proj", "v"},
-        "gate_proj": {"gate_up_proj", "0"},
-        "up_proj": {"gate_up_proj", "1"}
+        "q_proj": ("qkv_proj", "q"),
+        "k_proj": ("qkv_proj", "k"),
+        "v_proj": ("qkv_proj", "v"),
+        "gate_proj": ("gate_up_proj", 0),
+        "up_proj": ("gate_up_proj", 1)
     }
     def __init__(self, config: Qwen3Config):
         super().__init__()

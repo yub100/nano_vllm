@@ -65,7 +65,7 @@ class ModelRunner:
         peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
         current = torch.cuda.memory_stats()["allocated_bytes.all.current"]
         num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attentoin_heads)
+        head_dim = getattr(hf_config, "head_dim", hf_config.hidden_size // hf_config.num_attention_heads)
         block_bytes = 2 * hf_config.num_hidden_layers * self.block_size * num_kv_heads * head_dim * hf_config.torch_dtype.itemsize
         config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
         assert config.num_kvcache_blocks > 0
@@ -82,7 +82,7 @@ class ModelRunner:
         assert self.world_size > 1 and self.rank > 0
         self.event.wait()
         n = int.from_bytes(self.shm.buf[0:4], "little")
-        method_name, *args = pickle.loads(self.shm.buf[4, 4+n])
+        method_name, *args = pickle.loads(self.shm.buf[4:4+n])
         self.event.clear()
         return method_name, args
         
@@ -123,7 +123,7 @@ class ModelRunner:
 
     def prepare_block_tables(self, seqs: list[Sequence]):
         max_block_table_len = max(len(seq.block_table) for seq in seqs)
-        block_tables = [seq + [-1] * (max_block_table_len - len(seq.block_table)) for seq in seqs]
+        block_tables = [seq.block_table + [-1] * (max_block_table_len - len(seq.block_table)) for seq in seqs]
         block_tables = torch.tensor(block_tables, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         return block_tables
 
@@ -146,7 +146,7 @@ class ModelRunner:
         for seq in seqs:
             seqlen = len(seq)
             input_ids.extend(seq[seq.num_cached_tokens:])
-            positions.extend(list(range(seq.num_cached_blocks, seqlen)))
+            positions.extend(list(range(seq.num_cached_tokens, seqlen)))
             
             seqlen_q = seqlen - seq.num_cached_tokens
             seqlen_k = seqlen
@@ -169,17 +169,17 @@ class ModelRunner:
                 # 只做一件事——把本轮参与计算的 token 映射到 KV cache 物理槽位。(在前向计算时写入)
                 slot_mapping.extend(list(range(start, end)))
             
-            # some tokens have cached
-            if cu_seqlens_k[-1] > cu_seqlens_q[-1]:
-                block_tables = self.prepare_block_tables(seqs)
+        # some tokens have cached
+        if cu_seqlens_k[-1] > cu_seqlens_q[-1]:
+            block_tables = self.prepare_block_tables(seqs)
             
-            input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-            positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-            cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-            cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-            slot_mapping = torch.tensor(slot_mapping, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
-            set_context(True, max_seqlen_q, max_seqlen_k, cu_seqlens_q, cu_seqlens_k, None, slot_mapping, block_tables)
-            return input_ids, positions
+        input_ids = torch.tensor(input_ids, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        positions = torch.tensor(positions, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_q = torch.tensor(cu_seqlens_q, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        cu_seqlens_k = torch.tensor(cu_seqlens_k, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        slot_mapping = torch.tensor(slot_mapping, dtype=torch.int64, pin_memory=True).cuda(non_blocking=True)
+        set_context(True, max_seqlen_q, max_seqlen_k, cu_seqlens_q, cu_seqlens_k, None, slot_mapping, block_tables)
+        return input_ids, positions
 
     def prepare_decode(self, seqs: list[Sequence]):
         input_ids = []
@@ -221,13 +221,13 @@ class ModelRunner:
 
             # Write data to gpu
             graph_vars["input_ids"][:bs] = input_ids
-            graph_vars["position"][:bs] = position
+            graph_vars["positions"][:bs] = position
             # since this dict used to write kvcache, should drop invalid value.
             graph_vars["slot_mapping"].fill_(-1)
             graph_vars["slot_mapping"][:bs] = context.slot_mapping
             graph_vars["context_lens"].zero_()
             graph_vars["context_lens"][:bs] = context.context_lens
-            graph_vars["block_manages"][:bs, :context.block_tables.size(1)] = context.block_tables
+            graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 

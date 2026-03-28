@@ -9,7 +9,7 @@ def apply_rotary_emb(
 ):
     # x: [positons_size, self.num_heads, self.head_dim]
     # cos, sin: [positons_size, 1, head_dim / 2]
-    x1, x2 = torch.chunk(x.float(), 2, dim=1)
+    x1, x2 = torch.chunk(x.float(), 2, dim=-1)
     y1 = x1 * cos - x2 * sin
     y2 = x2 * cos + x1 * sin
     return torch.cat((y1, y2), dim=-1).to(x.dtype)

@@ -54,7 +54,7 @@ class ColumnParallelLinear(LinearBase):
 class MergedColumnParallelLinear(ColumnParallelLinear):
     def __init__(self, input_size: int, output_sizes: list[int], bias=False):
         self.output_sizes = output_sizes
-        super().__init__(input_size, output_sizes, bias)
+        super().__init__(input_size, sum(output_sizes), bias)
 
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor, loaded_shard_id: int):
         param_data = param.data
@@ -103,7 +103,7 @@ class QKVParallelLinear(ColumnParallelLinear):
 
 class RowParallelLinear(LinearBase):
     def __init__(self, input_size, output_size, bias = False):
-        tp_size = dist.get_world_size
+        tp_size = dist.get_world_size()
         super().__init__(divide(input_size, tp_size), output_size, bias, 1)
     
     def weight_loader(self, param: nn.Parameter, loaded_weight: torch.Tensor):

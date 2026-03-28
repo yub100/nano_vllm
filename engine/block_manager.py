@@ -134,7 +134,8 @@ class BlockManager:
         elif len(seq) % self.block_size == 0:
             assert last_block.hash == -1
             token_ids = seq.block(seq.num_blocks - 1)
-            h = self.compute_hash(token_ids, self.blocks[-2].hash if len(block_table) > 1 else -1)
+            prefix = self.blocks[block_table[-2]].hash if len(block_table) > 1 else -1
+            h = self.compute_hash(token_ids, prefix)
             last_block.update(h, token_ids)
             self.hash_to_block_id[h] = last_block.block_id
         else:
