@@ -3,8 +3,61 @@ from torch import nn
 import triton
 import triton.language as tl
 
-from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+import torch.nn.functional as F
+
+USE_FLASH_ATTN = False
+try:
+    from flash_attn import flash_attn_varlen_func, flash_attn_with_kvcache
+    USE_FLASH_ATTN = True
+except ImportError:
+    pass
 from utils.context import get_context
+
+
+def torch_varlen_attn(q, k, v, cu_seqlens_q, cu_seqlens_k, max_seqlen_q, max_seqlen_k, scale):
+    # 简化版：逐 batch 处理（够用）
+    outputs = []
+    B = cu_seqlens_q.numel() - 1
+
+    for i in range(B):
+        q_start, q_end = cu_seqlens_q[i], cu_seqlens_q[i+1]
+        k_start, k_end = cu_seqlens_k[i], cu_seqlens_k[i+1]
+
+        qi = q[q_start:q_end]
+        ki = k[k_start:k_end]
+        vi = v[k_start:k_end]
+
+        out = F.scaled_dot_product_attention(
+            qi.unsqueeze(0),  # [1, seq, H, D]
+            ki.unsqueeze(0),
+            vi.unsqueeze(0),
+            is_causal=True
+        )
+        outputs.append(out.squeeze(0))
+
+    return torch.cat(outputs, dim=0)
+
+
+def torch_kvcache_attn(q, k_cache, v_cache, context_lens, scale):
+    # q: [N, H, D]
+    outputs = []
+
+    for i in range(q.shape[0]):
+        qi = q[i:i+1]  # [1, H, D]
+        seq_len = context_lens[i]
+
+        ki = k_cache[i, :seq_len]
+        vi = v_cache[i, :seq_len]
+
+        out = F.scaled_dot_product_attention(
+            qi.unsqueeze(0),
+            ki.unsqueeze(0),
+            vi.unsqueeze(0),
+            is_causal=True
+        )
+        outputs.append(out.squeeze(0))
+
+    return torch.cat(outputs, dim=0)
 
 @triton.jit
 def store_kvcache_kernel(
@@ -73,16 +126,47 @@ class Attention(nn.Module):
         if k_cache.numel() and v_cache.numel():
             store_kvcache(k, v, k_cache, v_cache, context.slot_mapping)
         if context.is_prefill:
-            # block_tables have all seqs' block_table. if it is None, means it is the first round of prefill and no prefix.
-            # Because if not prefix cache(block_tables is None), the key and value are stored discretely in the kvcache,
-            # but block_tables is None and we can'y find all kv in cache by block_tables, so we should use k, v as parameters of fa
             if context.block_tables is not None:
                 k, v = k_cache, v_cache
-            o = flash_attn_varlen_func(q, k, v,
-                                        max_seqlen_q=context.max_seqlen_q, cu_seqlens_q=context.cu_seqlens_q,
-                                        max_seqlen_v=context.max_seqlen_k, cu_seqlens_k=context.cu_seqlens_k,
-                                        softmax_scale=self.scale, causal=True, block_table=context.block_tables)
+
+            if USE_FLASH_ATTN:
+                o = flash_attn_varlen_func(
+                    q, k, v,
+                    max_seqlen_q=context.max_seqlen_q,
+                    cu_seqlens_q=context.cu_seqlens_q,
+                    max_seqlen_v=context.max_seqlen_k,
+                    cu_seqlens_k=context.cu_seqlens_k,
+                    softmax_scale=self.scale,
+                    causal=True,
+                    block_table=context.block_tables
+                )
+            else:
+                o = torch_varlen_attn(
+                    q, k, v,
+                    context.cu_seqlens_q,
+                    context.cu_seqlens_k,
+                    context.max_seqlen_q,
+                    context.max_seqlen_k,
+                    self.scale
+                )
+
         else:
-            o = flash_attn_with_kvcache(q.unsqueeze(1), k_cache, v_cache, cache_seqlens=context.context_lens,
-                                        block_table=context.block_tables, softmax_scale=self.scale, causal=True)
+            if USE_FLASH_ATTN:
+                o = flash_attn_with_kvcache(
+                    q.unsqueeze(1),
+                    k_cache,
+                    v_cache,
+                    cache_seqlens=context.context_lens,
+                    block_table=context.block_tables,
+                    softmax_scale=self.scale,
+                    causal=True
+                )
+            else:
+                o = torch_kvcache_attn(
+                    q,
+                    k_cache,
+                    v_cache,
+                    context.context_lens,
+                    self.scale
+                )
         return o            
