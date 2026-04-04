@@ -2,7 +2,7 @@ from collections import deque
 import xxhash
 import numpy as np
 
-from engine.sequence import Sequence
+from engine.sequence import Sequence, SequenceStatus
 
 # cache block
 class Block:
@@ -64,13 +64,18 @@ class BlockManager:
     # Divide seq into blocks and allocate physical block, write the full block to hash_to_block_id.
     # Actually, the block store cache, due to q and k/v have a one-to-one relationship. Thus, can allocate cache for every token(q) indavance.
     def allocate(self, seq: Sequence):
-        assert not seq.block_table
-        h = -1
         cache_miss = False
-        for i in range(seq.num_blocks):
-            # actually there are no blocks
+        num_need_append_block = (seq.chunk_size + self.block_size - 1) // self.block_size
+        num_all_blocks = seq.num_blocks
+        i = 0
+
+        while cache_miss == False and i < num_all_blocks:
+        # for i in range(num_allocated_blocks, num_allocated_blocks + num_need_append_block):
             token_ids = seq.block(i)
-            h = self.compute_hash(token_ids, h) if len(token_ids) == self.block_size else -1
+
+            prefix = self.blocks[seq.block_table[-1]].hash if len(seq.block_table) > 0 else -1
+
+            h = self.compute_hash(token_ids, prefix) if len(token_ids) == self.block_size else -1
             
             # if key=h not exist, return -1
             block_id = self.hash_to_block_id.get(h, -1)
@@ -79,6 +84,7 @@ class BlockManager:
             # once cache_miss = True, all subsequent block will miss.
             if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
                 cache_miss = True
+                break
 
             # allocate an cache is two step, if cache_miss is true,
             # we just allocate block, don't update cache.thus don't update num_cached_tokens
@@ -90,7 +96,7 @@ class BlockManager:
                 block = self._allocate_block(block_id)
             else:
                 # hit means this block already exist and have cache, so update num_cached_tokens
-                seq.num_cached_tokens += self.block_size
+                seq.num_computed_tokens += self.block_size
 
                 if block_id in self.used_block_ids:
                     block = self.blocks[block_id]
@@ -104,6 +110,9 @@ class BlockManager:
                 self.hash_to_block_id[h] = block_id
 
             seq.block_table.append(block_id)
+            i += 1
+        if len(seq.block_table) == seq.num_blocks:
+            seq.is_decode = True
 
     def deallocate(self, seq: Sequence):
         for block_id in reversed(seq.block_table):
@@ -111,7 +120,6 @@ class BlockManager:
             block.ref_count -= 1
             if block.ref_count == 0:
                 self._deallocate_block(block_id)
-        seq.num_cached_tokens = 0
         seq.block_table.clear()
 
     # seq' blocks havn't allocated, seq.statue is waiting
@@ -120,7 +128,7 @@ class BlockManager:
     
     # seq'blocks already allocate, seq.statue is running
     def can_append(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)
+        return len(self.free_block_ids) >= seq.num_need_append_block
 
     def may_append(self, seq: Sequence):
         block_table = seq.block_table
@@ -140,3 +148,25 @@ class BlockManager:
             self.hash_to_block_id[h] = last_block.block_id
         else:
             assert last_block.hash == -1
+
+    # used for chunked prefill
+    def _append(self, seq: Sequence):
+        chunk_size = seq.chunk_size
+        num_new_block = (chunk_size + self.block_size - 1) // self.block_size
+        assert num_new_block <= len(self.free_block_ids)
+        for i in range(num_new_block):
+            prefix = self.blocks[seq.block_table[-1]].hash if len(seq.block_table) > 0 else -1
+            token_ids = seq.block(len(seq.block_table))
+
+            h = self.compute_hash(token_ids, prefix) if len(token_ids) == self.block_size else -1
+
+            block_id = self.free_block_ids[0]
+            block = self._allocate_block(block_id)
+
+            if h != -1:
+                block.update(h, token_ids)
+                self.hash_to_block_id[h] = block_id
+
+            seq.block_table.append(block_id)
+
+        

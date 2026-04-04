@@ -47,15 +47,17 @@ class ParallelLMHead(VocabParallelEmbedding):
     # x is hidden_state
     def forward(self, x: torch.Tensor):
         context = get_context()
-        if context.is_prefill:
-            last_index = context.cu_seqlens_q[1:] - 1
-            # Each input token have predicted one token, but we just need teh last input token's prediction when prefill.
-            x = x[last_index].contiguous()
+
+        last_index = context.cu_seqlens_q[1:] - 1
+        # Each input token have predicted one token, but we just need teh last input token's prediction when prefill.
+        x = x[last_index].contiguous()
+
         logits = F.linear(x, self.weight)
         if self.tp_size > 1:
             all_logits = [torch.empty_like(logits) for _ in range(self.tp_size)] if self.tp_rank == 0 else None
             dist.gather(logits, all_logits, 0)
             logits = torch.cat(all_logits, -1) if self.tp_rank == 0 else None
+        
         return logits
         
 

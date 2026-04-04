@@ -36,6 +36,11 @@ class Config:
     # calculate in ModelRunner.allocate_kv_cache()
     num_kvcache_blocks: int = -1
 
+    enable_chunked_prefill = True
+
+    # prefill chunk's size
+    max_num_chunk_tokens = 256
+
     def __post_init__(self):
         assert os.path.isdir(self.model)
 

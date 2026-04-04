@@ -66,16 +66,18 @@ class LLMEngine:
         return self.scheduler.is_finished()
 
     def step(self):
-        # seqs.shape likes [seq_num, seq's token num]
-        seqs, is_prefill = self.scheduler.schedule()
+        
+        scheduledBatch, num_batch_tokens = self.scheduler.schedule()
 
-        # since one run() only generate one token, thus token_ids.len = seqs.len(0)
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
+        # token_ids: list[int]
+        token_ids = self.model_runner.call("run", scheduledBatch)
 
-        self.scheduler.postprocess(seqs, token_ids)
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        num_tokens = sum(len(seq) for seq in seqs) if is_prefill else -len(seqs)
-        return outputs, num_tokens
+        self.scheduler.postprocess(scheduledBatch, token_ids)
+
+        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in scheduledBatch if seq.is_finished]
+        # num_decode_tokens = sum(len(seq) for seq in decode_seqs)
+        # num_prefill_tokens = sum(chunk_len for chunk_len in scheduledBatch.prefill_chunk_lens)
+        return outputs, num_batch_tokens
 
     # only after dealing this batch prompts can generate next batch prompts,
     # schedule only applies on one generate()'s prompts,
@@ -96,18 +98,13 @@ class LLMEngine:
             self.add_request(prompt, sp)
         
         outputs = {}
-        prefill_throughput = decode_throughput = 0.0
         while not self.is_finished():
             start = perf_counter()
-            output, num_tokens = self.step()
+            output, num_batch_tokens = self.step()
             if use_tqdm:
-                if num_tokens > 0:
-                    prefill_throughput = num_tokens / (perf_counter() - start)
-                else:
-                    decode_throughput = -num_tokens / (perf_counter() - start)
+                throughput = num_batch_tokens / (perf_counter() - start)
                 pbar.set_postfix({
-                    "Prefill": f"{int(prefill_throughput)}token/s",
-                    "Decode": f"{int(decode_throughput)}token/s"
+                    "Throughput": f"{int(throughput)}token/s",
                 })
             for seq_id, token_ids in output:
                 # map

@@ -12,6 +12,7 @@ class SequenceStatus(Enum):
 class Sequence:
     block_size = 256
     counter = count()
+    max_chunk_size = 256
 
     def __init__(self, token_ids: list[int], sampling_params=SamplingParams()):
         self.seq_id = next(Sequence.counter)
@@ -29,6 +30,33 @@ class Sequence:
         self.max_tokens = sampling_params.max_token
         self.ignore_eos = sampling_params.ignore_eos
 
+
+        self.num_computed_tokens = 0
+        self.is_decode = False
+
+    @property
+    def chunk_size(self):
+        if self.is_decode:
+            return 1
+        return (self.num_tokens - self.num_computed_tokens) if (self.num_tokens - self.num_computed_tokens) < self.max_chunk_size else self.max_chunk_size
+    
+    @property
+    def chunk_start_idx(self):
+        return self.num_computed_tokens 
+    
+    @property
+    def chunk_start_block_idx(self):
+        return self.num_computed_tokens // self.block_size
+
+    @property
+    def position_within_start_block(self):
+        return self.num_computed_tokens % self.block_size
+    
+    @property
+    def num_need_append_block(self):
+        return (self.num_computed_tokens + self.chunk_size + self.block_size - 1) // self.block_size - len(self.block_table)
+    
+        
     def __len__(self):
         return self.num_tokens
     
@@ -62,10 +90,14 @@ class Sequence:
     
     @property
     def last_block_num_tokens(self):
-        return self.num_tokens - (self.num_blocks - 1) * self.block_size
+        return self.num_computed_tokens - (len(self.block_table) - 1) * self.block_size
+    
+    @property
+    def last_block_tokens(self):
+        return self.token_ids[self.block_size * self.num_blocks : self.num_computed_tokens]
 
     def block(self, i):
-        return self.token_ids[self.block_size * i : self.block_size * (i + 1)]
+        return self.token_ids[self.block_size * i : self.block_size * (i + 1)] if i < self.num_blocks - 1 else self.token_ids[self.block_size * i : self.num_tokens]
 
     # update dataset but not update block, it happens in decode
     def append_token(self, token_id: int):
