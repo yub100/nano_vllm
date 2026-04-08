@@ -98,11 +98,16 @@ class LLMEngine:
             self.add_request(prompt, sp)
         
         outputs = {}
+        total_tokens = 0
+        generate_start = perf_counter()
         while not self.is_finished():
-            start = perf_counter()
             output, num_batch_tokens = self.step()
             if use_tqdm:
-                throughput = num_batch_tokens / (perf_counter() - start)
+                # throughput = num_batch_tokens / (perf_counter() - start)
+                total_tokens += num_batch_tokens
+                total_time = perf_counter() - generate_start
+                throughput = total_tokens / total_time
+
                 pbar.set_postfix({
                     "Throughput": f"{int(throughput)}token/s",
                 })
