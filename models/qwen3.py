@@ -85,7 +85,9 @@ class Qwen3Attention(nn.Module):
             q = self.q_norm(q)
             k = self.k_norm(k)
         q, k = self.rotary_emb(positions, q, k)
+        # 每张卡只有其分到的头产生的结果，是分片的
         o = self.attn(q, k, v)
+        # 每张卡的o映射为全量大小，然后把每张卡结果相加融合得到完整结果
         output = self.o_proj(o.flatten(1, -1))
         return output
 
@@ -128,9 +130,11 @@ class Qwen3DecoderLayer(nn.Module):
             rope_scaling=getattr(config, "rope_scaling", None)
         )
         self.mlp = Qwen3MLP(config.hidden_size, config.intermediate_size, config.hidden_act)
+        # 每张卡对全量hidden_states做相同操作，生成相同结果（因为计算量小）
         self.input_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(config.hidden_size, config.rms_norm_eps)
 
+    # hidden_states是全量的
     def forward(
         self,
         hidden_states: torch.Tensor,
